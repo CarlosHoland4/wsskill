@@ -14,7 +14,6 @@ O repositório está estruturado da seguinte forma:
 │   ├── monitoring/        # Scripts para monitoramento e registro de logs
 │   ├── utilities/         # Scripts utilitários de propósito geral
 │   └── README.md          # Documentação específica para cada categoria
-├── LICENSE
 └── README.md              # Este arquivo
 ```
 
