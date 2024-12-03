@@ -1,0 +1,24 @@
+comandos linux cli
+
+pwd = em que pasta estou
+ls = mostra as pastas disponiveis
+ls -l = mostra detalhes dos arquivos
+cd aaaa/bbbb/ccccc = navega entre as pastas
+cd . = volta pra pasta anterior
+d = diretorio = Um arquivo usado para armazenar outros arquivos.
+- = arquivo regular = Inclui arquivos legíveis, arquivos de imagens, arquivos binários e arquivos compactados.
+l = link simbólico = Aponta para outro arquivo.
+s = tomada = Permite a comunicação entre processos.
+p = tubo = Permite a comunicação entre processos.
+b = bloquear arquivo = Usado para se comunicar com o hardware.
+c = arquivo de caracteres = Usado para se comunicar com o hardware.
+
+ls -l /var/log/
+
+
+Permissão = Efeitos no arquivo = Efeitos no diretório
+ler (r)	= Permite que o conteúdo do arquivo seja lido ou copiado. = Sem permissão de execução no diretório, permite uma lista não detalhada de arquivos. Com permissão de execução, ls -l pode fornecer uma lista detalhada.
+
+escrever (w) = Permite que o conteúdo seja modificado ou substituído. Permite que arquivos sejam adicionados ou removidos de um diretório. = Para que essa permissão funcione, o diretório também deve ter permissão de execução.
+
+executar (x) = Permite que um arquivo seja executado como um processo, embora os arquivos de script exijam permissão de leitura, também. = Permite que um usuário mude para o diretório se os diretórios pai também tiverem permissão de execução.
