@@ -1,1 +1,26 @@
+CRIAÇÂO S3
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Criação de um bucket S3 com criptografia e bloqueio de acesso público desativado.
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: bucket0padrao
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+Outputs:
+  BucketName:
+    Description: Nome do bucket S3 criado.
+    Value: !Ref S3Bucket
+
 
