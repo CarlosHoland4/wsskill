@@ -1,1 +1,11 @@
+tutorial ssh putty
 
+putty ssh tutorial
+
+criar instancia EC2 
+criar key pair > baixar em formato .ppk
+entrar no putty > ssh > Auth > browse > arquivo ppk 
+Session 
+console aws > seleciona a instancia > connect > SSH > copia o endereço
+cola em session
+nome de usuario vai estar no public dns
