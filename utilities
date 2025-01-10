@@ -9,3 +9,23 @@ Session
 console aws > seleciona a instancia > connect > SSH > copia o endereço
 cola em session
 nome de usuario vai estar no public dns
+
+Subir site pelo EC2
+
+habilitar acesso a porta 85
+sudo apt update
+sudo apt install nginx
+cd /var/www/html
+nano index.html
+cd /var/www/html
+nano index.html
+cd /etc/nginx/sites-available/
+sudo nano default
+alterar: server_name instance ipv4;
+alterar: proxy_pass instance ipv4:85;
+alterar o cometario 
+mudar para 85 os 2 80
+abaixo de server_name: root /var/www/html;
+                       index index.html
+sudo nano /usr/share/nginx/html (testar essa)
+
