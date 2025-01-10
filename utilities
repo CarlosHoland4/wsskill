@@ -10,7 +10,7 @@ console aws > seleciona a instancia > connect > SSH > copia o endereço
 cola em session
 nome de usuario vai estar no public dns
 
-Subir site pelo EC2
+Subir site pelo EC2 usando ubuntu
 
 habilitar acesso a porta 85
 sudo apt update
@@ -29,3 +29,22 @@ abaixo de server_name: root /var/www/html;
                        index index.html
 sudo nano /usr/share/nginx/html (testar essa)
 
+Subir site pelo EC2 usando linux
+
+
+1- Criar uma instancia EC2 Linux
+
+2- Atualizar os pacotes do sistema:
+   - sudo yum update -y
+
+3- Instalar o Nginx no Amazon Linux 1:
+   - sudo yum install -y epel-release
+   - sudo yum install -y nginx
+
+4- Iniciar o Nginx:
+   - sudo systemctl start nginx
+   - sudo systemctl enable nginx
+
+5- Configurar o Nginx:
+  - cd /usr/share/nginx/html  (diretório padrão onde o Nginx armazena os arquivos HTML)
+  - sudo nano index.html (editar arquivo)
