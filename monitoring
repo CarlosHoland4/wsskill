@@ -76,3 +76,62 @@ def lambda_handler(event, context):
         'statusCode': 200,
         'body': json.dumps('Notificação enviada com sucesso!')
     }
+
+
+
+
+
+ADD, EXCLUIR E RENOMEAR OBJETOS NO S3 - ENVIO DE LOGS PRO CLOUDWATCH
+
+Criar S3 e criar notificações para PUT e DELETE separadamente porém mandar os 2 para a mesma lambda
+
+criar lambda do zero com python 3x
+
+add esse codigo:
+import json
+import boto3
+from datetime import datetime, timedelta
+
+# Simulando uma memória temporária para rastrear exclusões e adições
+recent_events = {}
+
+def lambda_handler(event, context):
+    global recent_events
+    current_time = datetime.utcnow()
+
+    for record in event['Records']:
+        event_name = record['eventName']
+        bucket_name = record['s3']['bucket']['name']
+        object_key = record['s3']['object']['key']
+        event_time = current_time.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Adição de objetos
+        if "ObjectCreated" in event_name:
+            print(f"[ADIÇÃO] Objeto adicionado ao bucket {bucket_name}: {object_key}")
+            # Armazena a adição em memória
+            recent_events[object_key] = {"type": "added", "time": event_time}
+
+        # Exclusão de objetos
+        elif "ObjectRemoved" in event_name:
+            print(f"[EXCLUSÃO] Objeto removido do bucket {bucket_name}: {object_key}")
+            # Verifica se uma renomeação ocorreu
+            if object_key in recent_events and recent_events[object_key]["type"] == "added":
+                print(f"[RENOMEAÇÃO] Objeto {object_key} foi renomeado recentemente no bucket {bucket_name}")
+                # Remove o evento processado
+                del recent_events[object_key]
+            else:
+                # Armazena a exclusão em memória
+                recent_events[object_key] = {"type": "deleted", "time": event_time}
+
+    # Limpeza de eventos antigos
+    recent_events = {
+        key: value for key, value in recent_events.items()
+        if datetime.strptime(value["time"], '%Y-%m-%d %H:%M:%S') > current_time - timedelta(minutes=5)
+    }
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Logs processados com sucesso.')
+    }
+
+testar no cloudwatch - log - log groups - achar nome da função
