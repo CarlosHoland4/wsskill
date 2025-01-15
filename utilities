@@ -74,3 +74,21 @@ docker-compose up -d
 ja esta rodando se quiser testar eh so dar "docker ps"
 
 http://<IP-PÚBLICO-DA-EC2>:porta especifica do docker ex: 80, 3000, 443
+
+
+subir docker direto pelo docker usando ec2 
+
+sudo yum update -y
+sudo yum install docker -y
+sudo service docker start
+sudo usermod -aG docker ec2-user
+(sair do terminal e voltar)
+
+docker pull grafana/grafana
+
+docker run -d -p 9000:9000 portainer/portainer
+
+docker ps
+
+docker stop *imagem*
+
