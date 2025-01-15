@@ -48,3 +48,29 @@ Subir site pelo EC2 usando linux
 5- Configurar o Nginx:
   - cd /usr/share/nginx/html  (diretório padrão onde o Nginx armazena os arquivos HTML)
   - sudo nano index.html (editar arquivo)
+
+
+
+
+Subir docker pelo Ec2 usando repositorio github
+
+sudo yum update -y
+
+sudo yum install docker -y
+sudo service docker start
+sudo usermod -aG docker ec2-user
+-fechar o terminal e voltar
+
+sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+docker-compose --version
+
+sudo yum install git -y
+
+git clone https://github.com/fabricioveronez/catalogo-docker-compose.git
+cd catalogo-docker-compose/Grafana
+
+docker-compose up -d
+ja esta rodando se quiser testar eh so dar "docker ps"
+
+http://<IP-PÚBLICO-DA-EC2>:porta especifica do docker ex: 80, 3000, 443
