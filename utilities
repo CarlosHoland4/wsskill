@@ -50,6 +50,15 @@ Subir site pelo EC2 usando linux
   - sudo nano index.html (editar arquivo)
 
 
+subir apenas o nginx pelo ec2 usando linux 2
+sudo yum update -y
+
+sudo amazon-linux-extras enable nginx1
+sudo yum install nginx -y
+
+sudo systemctl start nginx
+sudo systemctl enable nginx
+
 
 
 Subir docker pelo Ec2 usando repositorio github
