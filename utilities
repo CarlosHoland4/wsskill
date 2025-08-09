@@ -1,117 +1,316 @@
-tutorial ssh putty
+## Criar instância EC2
 
-putty ssh tutorial
+1. No **AWS Console** → **EC2** → **Launch Instance**.
+2. Escolha AMI (Ubuntu, Amazon Linux 2, etc.), tipo t2.micro/t3.micro.
+3. **Key pair**: crie e baixe (se for usar PuTTY no Windows, exporte para `.ppk`).
+4. **Security Group**: abra temporariamente **22/TCP** (SSH) para seu IP. Para Nginx/HTTP, abra **80/TCP** e, se necessário, **85/TCP**.
+5. Lance a instância e anote **Public IPv4** e **Public DNS**.
 
-criar instancia EC2 
-criar key pair > baixar em formato .ppk
-entrar no putty > ssh > Auth > browse > arquivo ppk 
-Session 
-console aws > seleciona a instancia > connect > SSH > copia o endereço
-cola em session
-nome de usuario vai estar no public dns
+## Acesso SSH via PuTTY (Windows)
 
-Subir site pelo EC2 usando ubuntu
+Leia `ssh/putty_tutorial.md`.
 
-habilitar acesso a porta 85
-sudo apt update
-sudo apt install nginx
-cd /var/www/html
-nano index.html
-cd /var/www/html
-nano index.html
-cd /etc/nginx/sites-available/
-sudo nano default
-alterar: server_name instance ipv4;
-alterar: proxy_pass instance ipv4:85;
-alterar o cometario 
-mudar para 85 os 2 80
-abaixo de server_name: root /var/www/html;
-                       index index.html
-sudo nano /usr/share/nginx/html (testar essa)
+## Ubuntu: Nginx em porta 85 (site estático)
 
-Subir site pelo EC2 usando linux
+Script: `ec2/ubuntu/nginx_static_port85.sh`
 
+* Instala Nginx, cria `/var/www/html/index.html`, muda o **listen 85**, define `root` e `index`.
+* Lembre-se de abrir **porta 85 no Security Group**.
 
-1- Criar uma instancia EC2 Linux
+## Ubuntu: Nginx como reverse proxy (80 → 85)
 
-2- Atualizar os pacotes do sistema:
-   - sudo yum update -y
+Script: `ec2/ubuntu/nginx_reverse_proxy_80_to_85.sh`
 
-3- Instalar o Nginx no Amazon Linux 1:
-   - sudo yum install -y epel-release
-   - sudo yum install -y nginx
+* Mantém Nginx ouvindo em 80 e faz **proxy\_pass** para um app escutando em **localhost:85**.
 
-4- Iniciar o Nginx:
-   - sudo systemctl start nginx
-   - sudo systemctl enable nginx
+## Amazon Linux 1/2: Instalar e iniciar Nginx
 
-5- Configurar o Nginx:
-  - cd /usr/share/nginx/html  (diretório padrão onde o Nginx armazena os arquivos HTML)
-  - sudo nano index.html (editar arquivo)
+Scripts:
 
+* `ec2/amazon-linux-1/nginx_install.sh`
+* `ec2/amazon-linux-2/nginx_install.sh`
 
-subir apenas o nginx pelo ec2 usando linux 2
+## Docker na EC2 + Docker Compose
+
+Scripts:
+
+* `docker/install_docker_amzn.sh`
+* `docker/install_compose.sh`
+
+## Rodar Grafana e Portainer (Docker)
+
+Scripts:
+
+* `docker/run_grafana.sh`
+* `docker/run_portainer.sh`
+* Extra: `docker/clone_catalogo_compose.md` para clonar e subir stack via `docker-compose`.
+
+## Exemplo de site HTML
+
+Arquivo: `web/index.html` (modelo simples em PT-BR).
+
+---
+
+# ssh/putty\_tutorial.md
+
+## Tutorial SSH com PuTTY (Windows)
+
+1. Converta/obtenha sua chave em **.ppk** (no download do key pair do AWS ou usando PuTTYgen).
+2. Abra **PuTTY** → **Category** → **Connection > SSH > Auth** → **Browse...** → selecione o arquivo `.ppk`.
+3. Vá em **Session**. No **Host Name (or IP address)** cole o **Endereço SSH**:
+
+   * No **AWS Console** → **EC2** → **Instances** → selecione a instância → **Connect** → guia **SSH** → copie o `ec2-user@...` (Amazon Linux) ou `ubuntu@...` (Ubuntu).
+4. Usuário mais comum:
+
+   * **Ubuntu**: `ubuntu`
+   * **Amazon Linux**: `ec2-user`
+5. Clique **Open** para conectar.
+
+> Dica: salve a sessão em **Saved Sessions** para reconectar mais rápido depois.
+
+---
+
+# ec2/common/open\_security\_group\_notes.md
+
+Abra a porta **85/TCP** no **Security Group** da instância:
+EC2 → Instances → selecione a instância → **Security** → Security groups → **Edit inbound rules** → **Add rule**:
+
+* Type: **Custom TCP**
+* Port range: **85**
+* Source: **My IP** (ou um range controlado)
+  Salve.
+
+---
+
+# ec2/ubuntu/nginx\_static\_port85.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Atualiza pacotes e instala Nginx
+sudo apt update -y
+sudo apt install -y nginx
+
+# Conteúdo HTML básico
+sudo mkdir -p /var/www/html
+sudo tee /var/www/html/index.html > /dev/null <<'HTML'
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Olá</title>
+</head>
+<body>
+  <h1>Olá, sou Carlos</h1>
+</body>
+</html>
+HTML
+
+# Configura Nginx para escutar na porta 85 servindo o /var/www/html
+NGINX_DEFAULT=/etc/nginx/sites-available/default
+sudo cp "$NGINX_DEFAULT" ${NGINX_DEFAULT}.bak
+
+sudo awk '
+  BEGIN{changed=0}
+  /listen 80 default_server;/{sub(/80/ ,"85"); changed=1}
+  /listen \[::\]:80 default_server;/{sub(/80/ ,"85"); changed=1}
+  {print}
+' ${NGINX_DEFAULT}.bak | sudo tee "$NGINX_DEFAULT" > /dev/null
+
+# Garante root e index no server block
+sudo sed -i 's|#\?\s*root .*|    root /var/www/html;|g' "$NGINX_DEFAULT"
+sudo sed -i 's|#\?\s*index .*|    index index.html;|g' "$NGINX_DEFAULT"
+
+# Testa e aplica
+sudo nginx -t
+sudo systemctl restart nginx
+sudo systemctl enable nginx
+
+echo "Nginx pronto em porta 85. Lembre-se de abrir a porta 85 no Security Group."
+```
+
+---
+
+# ec2/ubuntu/nginx\_reverse\_proxy\_80\_to\_85.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+sudo apt update -y
+sudo apt install -y nginx
+
+# Exemplo de server block que escuta em 80 e faz proxy para app em 127.0.0.1:85
+cat <<'CONF' | sudo tee /etc/nginx/sites-available/default > /dev/null
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass http://127.0.0.1:85;
+    }
+}
+CONF
+
+sudo nginx -t
+sudo systemctl restart nginx
+sudo systemctl enable nginx
+
+echo "Reverse proxy ativo: porta 80 → 127.0.0.1:85. Abra a porta 80 no Security Group."
+```
+
+---
+
+# ec2/amazon-linux-1/nginx\_install.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
 sudo yum update -y
-
-sudo amazon-linux-extras enable nginx1
-sudo yum install nginx -y
+sudo yum install -y epel-release
+sudo yum install -y nginx
 
 sudo systemctl start nginx
 sudo systemctl enable nginx
 
+echo "Nginx em execução no Amazon Linux 1 (porta 80). HTML em /usr/share/nginx/html"
+```
 
+---
 
-Subir docker pelo Ec2 usando repositorio github
+# ec2/amazon-linux-2/nginx\_install.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
 
 sudo yum update -y
+sudo amazon-linux-extras enable nginx1
+sudo yum clean metadata
+sudo yum install -y nginx
 
-sudo yum install docker -y
-sudo service docker start
+sudo systemctl start nginx
+sudo systemctl enable nginx
+
+# Editar página padrão
+sudo bash -lc 'echo "<h1>Olá, sou Carlos</h1>" > /usr/share/nginx/html/index.html'
+
+echo "Nginx em execução no Amazon Linux 2 (porta 80). HTML em /usr/share/nginx/html"
+```
+
+---
+
+# docker/install\_docker\_amzn.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+sudo yum update -y
+sudo yum install -y docker
+sudo systemctl start docker
+sudo systemctl enable docker
 sudo usermod -aG docker ec2-user
--fechar o terminal e voltar
 
+echo "Docker instalado. Faça logout/login para aplicar o grupo docker."
+```
+
+---
+
+# docker/install\_compose.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Instala docker-compose standalone (legacy). Alternativa: plugin do Docker se disponível.
 sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
 sudo chmod +x /usr/local/bin/docker-compose
-docker-compose --version
 
-sudo yum install git -y
+docker-compose --version || true
+```
+
+---
+
+# docker/run\_grafana.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+docker pull grafana/grafana:latest
+docker run -d --name grafana -p 3000:3000 grafana/grafana:latest
+
+echo "Acesse: http://<IP-PUBLICO-EC2>:3000"
+```
+
+---
+
+# docker/run\_portainer.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+docker pull portainer/portainer-ce:latest
+docker run -d --name portainer \
+  -p 9000:9000 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v portainer_data:/data \
+  portainer/portainer-ce:latest
+
+echo "Acesse: http://<IP-PUBLICO-EC2>:9000"
+```
+
+---
+
+# docker/clone\_catalogo\_compose.md
+
+```bash
+# Pré-requisitos: Docker + docker-compose instalados
+sudo yum install -y git
 
 git clone https://github.com/fabricioveronez/catalogo-docker-compose.git
 cd catalogo-docker-compose/Grafana
 
 docker-compose up -d
-ja esta rodando se quiser testar eh so dar "docker ps"
-
-http://<IP-PÚBLICO-DA-EC2>:porta especifica do docker ex: 80, 3000, 443
-
-
-subir docker direto pelo docker usando ec2 
-
-sudo yum update -y
-sudo yum install docker -y
-sudo service docker start
-sudo usermod -aG docker ec2-user
-(sair do terminal e voltar)
-
-docker pull grafana/grafana
-
-docker run -d -p 9000:9000 portainer/portainer
 
 docker ps
+# Acesse via: http://<IP-PUBLICO-EC2>:<porta do serviço> (ex.: 80, 3000, 443)
+```
 
-docker stop *imagem*
+---
 
+# web/index.html
 
-html padrao 
-
+```html
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Olá</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Olá</title>
 </head>
 <body>
-    <h1>Olá, sou Carlos</h1>
+  <h1>Olá, sou Carlos</h1>
 </body>
 </html>
+```
+
+---
+
+## 📝 Notas rápidas
+
+* **Porta 85**: sempre abra no **Security Group** se for acessar de fora. Em Ubuntu, o script `nginx_static_port85.sh` já troca o `listen` para 85.
+* **Proxy vs Estático**: use *reverse proxy* se houver um app escutando em 85; para HTML simples, use o modo estático.
+* **Usuários padrão**: `ubuntu` (Ubuntu), `ec2-user` (Amazon Linux).
+* **PuTTY**: `.ppk` em *Connection > SSH > Auth*. Host/DNS em **Session**.
+* **Docker**: após `usermod -aG docker`, faça **logout/login**.
