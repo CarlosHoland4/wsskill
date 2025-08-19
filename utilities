@@ -307,6 +307,570 @@ docker ps
 
 ---
 
+## código python padrão 
+
+# lambda_function.py
+# Lambda "caixa de automações" com roteamento por evento e utilitários úteis.
+from __future__ import annotations
+import os, json, time, hmac, hashlib, base64, math, uuid, gzip, io, re, logging
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Optional, List, Tuple
+from decimal import Decimal
+
+import boto3
+from botocore.exceptions import ClientError, BotoCoreError
+from botocore.config import Config as BotoConfig
+
+# ------------- Config via ENV -------------
+ENV = {
+    "REGION": os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1",
+    "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO"),
+    "METRIC_NAMESPACE": os.getenv("METRIC_NAMESPACE", "AutomationLambda"),
+    "TABLE_IDEMPO": os.getenv("TABLE_IDEMPO"),                 # DynamoDB p/ idempotência (opcional)
+    "TABLE_DATA": os.getenv("TABLE_DATA"),                     # DynamoDB de dados (opcional)
+    "BUCKET_OUT": os.getenv("BUCKET_OUT"),                     # S3 destino p/ artefatos (opcional)
+    "SQS_QUEUE_URL": os.getenv("SQS_QUEUE_URL"),               # SQS para enfileirar (opcional)
+    "SNS_TOPIC_ARN": os.getenv("SNS_TOPIC_ARN"),               # SNS para publicar (opcional)
+    "SECRET_NAME": os.getenv("SECRET_NAME"),                   # Secrets Manager (opcional)
+    "PARAM_NAME": os.getenv("PARAM_NAME"),                     # SSM Param Store (opcional)
+    "KMS_KEY_ID": os.getenv("KMS_KEY_ID"),                     # KMS opcional p/ encriptar
+    "IDEMPO_TTL_HOURS": int(os.getenv("IDEMPO_TTL_HOURS", "72")),
+}
+
+# ------------- Logging estruturado + correlação -------------
+class JsonLogger:
+    def __init__(self, level: str = "INFO"):
+        self.logger = logging.getLogger("automation")
+        self.logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+        if not self.logger.handlers:
+            h = logging.StreamHandler()
+            fmt = logging.Formatter("%(message)s")
+            h.setFormatter(fmt)
+            self.logger.addHandler(h)
+
+    def log(self, level: str, msg: str, **kv):
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": level.upper(),
+            "message": msg,
+            **kv,
+        }
+        self.logger.log(getattr(logging, level.upper(), logging.INFO), json.dumps(payload, default=to_json))
+
+    def info(self, msg, **kv): self.log("INFO", msg, **kv)
+    def warn(self, msg, **kv): self.log("WARNING", msg, **kv)
+    def error(self, msg, **kv): self.log("ERROR", msg, **kv)
+    def debug(self, msg, **kv): self.log("DEBUG", msg, **kv)
+
+LOG = JsonLogger(ENV["LOG_LEVEL"])
+
+def get_correlation_id(event: dict, context) -> str:
+    # tenta cabeçalhos APIGW http -> trace ids -> record ids -> fallback
+    try:
+        headers = (event.get("headers") or {}) if isinstance(event, dict) else {}
+        cid = headers.get("x-correlation-id") or headers.get("X-Correlation-Id")
+        if not cid and "requestContext" in event:
+            rc = event["requestContext"]
+            if isinstance(rc, dict):
+                cid = rc.get("requestId") or (rc.get("http") or {}).get("requestId")
+        if not cid and isinstance(event, dict) and "Records" in event and event["Records"]:
+            r0 = event["Records"][0]
+            cid = r0.get("messageId") or r0.get("responseElements", {}).get("x-amz-request-id")
+        if not cid:
+            cid = getattr(context, "aws_request_id", None) or str(uuid.uuid4())
+        return str(cid)
+    except Exception:
+        return str(uuid.uuid4())
+
+# ------------- Boto3 clients (com retries do botocore) -------------
+_BOTO_CFG = BotoConfig(
+    retries={"max_attempts": 8, "mode": "standard"},
+    region_name=ENV["REGION"],
+    user_agent_extra="AutomationLambda/1.0"
+)
+_s3 = boto3.client("s3", config=_BOTO_CFG)
+_ddb = boto3.client("dynamodb", config=_BOTO_CFG)
+_sqs = boto3.client("sqs", config=_BOTO_CFG)
+_sns = boto3.client("sns", config=_BOTO_CFG)
+_ssm = boto3.client("ssm", config=_BOTO_CFG)
+_secrets = boto3.client("secretsmanager", config=_BOTO_CFG)
+_kms = boto3.client("kms", config=_BOTO_CFG)
+_logs = boto3.client("logs", config=_BOTO_CFG)  # opcional caso queira usar diretamente
+
+# ------------- Helpers JSON -------------
+def to_json(o):
+    if isinstance(o, (datetime, )):
+        return o.isoformat()
+    if isinstance(o, Decimal):
+        return float(o)
+    return str(o)
+
+def json_dumps(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, default=to_json)
+
+# ------------- Métricas EMF (Embedded Metric Format) -------------
+def put_metric(name: str, value: float, unit: str = "Count", dims: Optional[Dict[str, str]] = None):
+    # imprime no log no formato EMF, o CloudWatch coleta e cria métricas personalizadas
+    dims = dims or {}
+    emf = {
+        "_aws": {
+            "Timestamp": int(time.time() * 1000),
+            "CloudWatchMetrics": [{
+                "Namespace": ENV["METRIC_NAMESPACE"],
+                "Dimensions": [list(dims.keys())] if dims else [[]],
+                "Metrics": [{"Name": name, "Unit": unit}],
+            }]
+        },
+        name: value
+    }
+    emf.update(dims)
+    print(json_dumps(emf))  # NÃO use LOG aqui; EMF requer linha "crua"
+
+# ------------- Cache simples p/ segredos/params -------------
+_CACHE: Dict[str, Tuple[float, Any]] = {}
+def cache_get(key: str, ttl: int = 300):
+    now = time.time()
+    if key in _CACHE:
+        ts, val = _CACHE[key]
+        if now - ts < ttl:
+            return val
+    return None
+
+def cache_set(key: str, val: Any):
+    _CACHE[key] = (time.time(), val)
+    return val
+
+# ------------- Idempotência via DynamoDB -------------
+def idempo_check_and_lock(key: str, ttl_hours: int = ENV["IDEMPO_TTL_HOURS"]) -> bool:
+    """Retorna True se 'lock' foi criado agora (primeira vez), False se já existia."""
+    if not ENV["TABLE_IDEMPO"]:
+        return True  # sem tabela, não impede; siga em frente
+    expires_at = int((datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).timestamp())
+    try:
+        _ddb.put_item(
+            TableName=ENV["TABLE_IDEMPO"],
+            Item={"pk": {"S": key}, "expires_at": {"N": str(expires_at)}},
+            ConditionExpression="attribute_not_exists(pk)"
+        )
+        LOG.debug("Idempotency lock created", key=key)
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("ConditionalCheckFailedException",):
+            LOG.info("Duplicate detected (idempotent)", key=key)
+            return False
+        raise
+
+# ------------- Utils AWS -------------
+def s3_get(bucket: str, key: str) -> bytes:
+    r = _s3.get_object(Bucket=bucket, Key=key)
+    return r["Body"].read()
+
+def s3_put(bucket: str, key: str, data: bytes, content_type: str = "application/octet-stream"):
+    _s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
+
+def s3_presign(bucket: str, key: str, expires: int = 900) -> str:
+    return _s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires
+    )
+
+def ddb_put(table: str, item: Dict[str, Any], if_not_exists_pk: Optional[str] = None):
+    item_ddb = to_ddb(item)
+    if if_not_exists_pk:
+        _ddb.put_item(
+            TableName=table,
+            Item=item_ddb,
+            ConditionExpression=f"attribute_not_exists({if_not_exists_pk})"
+        )
+    else:
+        _ddb.put_item(TableName=table, Item=item_ddb)
+
+def ddb_get(table: str, key: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    r = _ddb.get_item(TableName=table, Key=to_ddb(key))
+    return from_ddb(r.get("Item")) if r.get("Item") else None
+
+def ddb_update(table: str, key: Dict[str, Any], update_expr: str, expr_vals: Dict[str, Any], expr_names: Optional[Dict[str, str]] = None):
+    _ddb.update_item(
+        TableName=table,
+        Key=to_ddb(key),
+        UpdateExpression=update_expr,
+        ExpressionAttributeValues=to_ddb(expr_vals),
+        ExpressionAttributeNames=expr_names or {}
+    )
+
+def sns_publish(topic_arn: str, message: str, attrs: Optional[Dict[str, str]] = None):
+    attrs = attrs or {}
+    msg_attrs = {k: {"DataType": "String", "StringValue": v} for k, v in attrs.items()}
+    _sns.publish(TopicArn=topic_arn, Message=message, MessageAttributes=msg_attrs)
+
+def sqs_send(queue_url: str, body: Dict[str, Any], delay_seconds: int = 0, attrs: Optional[Dict[str, str]] = None):
+    attrs = attrs or {}
+    mattrs = {k: {"DataType": "String", "StringValue": v} for k, v in attrs.items()}
+    _sqs.send_message(QueueUrl=queue_url, MessageBody=json_dumps(body), DelaySeconds=delay_seconds, MessageAttributes=mattrs)
+
+def secret_get(name: str) -> str:
+    cache_key = f"secret::{name}"
+    c = cache_get(cache_key)
+    if c is not None:
+        return c
+    v = _secrets.get_secret_value(SecretId=name).get("SecretString") or ""
+    return cache_set(cache_key, v)
+
+def param_get(name: str, with_decrypt: bool = True) -> str:
+    cache_key = f"param::{name}"
+    c = cache_get(cache_key)
+    if c is not None:
+        return c
+    r = _ssm.get_parameter(Name=name, WithDecryption=with_decrypt)
+    return cache_set(cache_key, r["Parameter"]["Value"])
+
+def kms_encrypt(key_id: str, plaintext: bytes) -> bytes:
+    r = _kms.encrypt(KeyId=key_id, Plaintext=plaintext)
+    return r["CiphertextBlob"]
+
+def kms_decrypt(blob: bytes) -> bytes:
+    r = _kms.decrypt(CiphertextBlob=blob)
+    return r["Plaintext"]
+
+# ------------- Conversores DynamoDB -------------
+def to_ddb(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Converte dict Python -> DynamoDB AttributeValue (tipos simples)."""
+    out: Dict[str, Any] = {}
+    for k, v in item.items():
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            out[k] = {"BOOL": v}
+        elif isinstance(v, (int, float, Decimal)):
+            out[k] = {"N": str(v)}
+        elif isinstance(v, bytes):
+            out[k] = {"B": v}
+        elif isinstance(v, (list, tuple)):
+            out[k] = {"L": [wrap_ddb(x) for x in v]}
+        elif isinstance(v, dict):
+            out[k] = {"M": to_ddb(v)}
+        else:
+            out[k] = {"S": str(v)}
+    return out
+
+def wrap_ddb(v: Any) -> Dict[str, Any]:
+    if v is None:
+        return {"NULL": True}
+    if isinstance(v, bool):
+        return {"BOOL": v}
+    if isinstance(v, (int, float, Decimal)):
+        return {"N": str(v)}
+    if isinstance(v, bytes):
+        return {"B": v}
+    if isinstance(v, (list, tuple)):
+        return {"L": [wrap_ddb(x) for x in v]}
+    if isinstance(v, dict):
+        return {"M": to_ddb(v)}
+    return {"S": str(v)}
+
+def from_ddb(item: Dict[str, Any]) -> Dict[str, Any]:
+    def unwrap(av):
+        if "S" in av: return av["S"]
+        if "N" in av: return Decimal(av["N"])
+        if "BOOL" in av: return bool(av["BOOL"])
+        if "B" in av: return av["B"]
+        if "L" in av: return [unwrap(x) for x in av["L"]]
+        if "M" in av: return {k: unwrap(v) for k, v in av["M"].items()}
+        if "NULL" in av: return None
+        return None
+    return {k: unwrap(v) for k, v in item.items()}
+
+# ------------- Utilidades diversas -------------
+def gzip_bytes(data: bytes) -> bytes:
+    b = io.BytesIO()
+    with gzip.GzipFile(fileobj=b, mode="wb") as gz:
+        gz.write(data)
+    return b.getvalue()
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+# ------------- Handlers por origem -------------
+def handle_api_gateway(event: dict, context) -> dict:
+    # Suporta REST/API Gateway HTTP (v1/v2)
+    path = event.get("rawPath") or event.get("path") or "/"
+    method = (event.get("requestContext", {}).get("http", {}) or {}).get("method") or event.get("httpMethod") or "GET"
+    qs = event.get("queryStringParameters") or {}
+    body = event.get("body")
+    is_base64 = event.get("isBase64Encoded", False)
+    if body and is_base64:
+        body = base64.b64decode(body).decode("utf-8", "ignore")
+
+    LOG.info("API request", path=path, method=method, qs=qs)
+
+    if path == "/health":
+        put_metric("HealthCheck", 1)
+        return resp_json(200, {"ok": True, "ts": now_utc_iso()})
+
+    if path == "/run" and method in ("POST", "GET"):
+        task = (qs or {}).get("task")
+        if not task and body:
+            try:
+                j = json.loads(body)
+                task = j.get("task")
+            except Exception:
+                pass
+        result = run_task(task or "noop", event)
+        return resp_json(200, {"task": task or "noop", "result": result})
+
+    if path == "/presign" and ENV["BUCKET_OUT"]:
+        key = (qs or {}).get("key") or f"example/{uuid.uuid4()}.txt"
+        url = s3_presign(ENV["BUCKET_OUT"], key, 900)
+        return resp_json(200, {"url": url, "bucket": ENV["BUCKET_OUT"], "key": key})
+
+    return resp_json(404, {"error": "Not found", "path": path})
+
+def handle_s3(event: dict, context) -> dict:
+    failures: List[str] = []
+    for rec in event.get("Records", []):
+        b = rec["s3"]["bucket"]["name"]
+        k = rec["s3"]["object"]["key"]
+        lock_key = f"s3://{b}/{k}"
+        try:
+            if not idempo_check_and_lock(lock_key):
+                continue
+            data = s3_get(b, k)
+            size = len(data)
+            md5 = hashlib.md5(data).hexdigest()
+            LOG.info("S3 object received", bucket=b, key=k, size=size, md5=md5)
+            put_metric("S3ObjectProcessed", 1, dims={"Bucket": b})
+            # Exemplo de "processamento": gerar manifesto JSON e salvar no BUCKET_OUT (se houver)
+            if ENV["BUCKET_OUT"]:
+                manifest = {
+                    "source_bucket": b, "source_key": k, "size": size, "md5": md5,
+                    "processed_at": now_utc_iso(), "request_id": context.aws_request_id,
+                }
+                out_key = f"processed/{k}.manifest.json"
+                s3_put(ENV["BUCKET_OUT"], out_key, json_dumps(manifest).encode("utf-8"), "application/json")
+        except Exception as e:
+            LOG.error("S3 record failed", bucket=b, key=k, error=str(e))
+            failures.append(lock_key)
+    return {"failed": failures}
+
+def handle_sqs(event: dict, context) -> dict:
+    # SQS batch response com partial failures
+    failures = []
+    for rec in event.get("Records", []):
+        msg_id = rec.get("messageId")
+        lock_key = f"sqs::{msg_id}"
+        try:
+            if not idempo_check_and_lock(lock_key):
+                continue
+            body = rec.get("body") or "{}"
+            payload = json.loads(body)
+            LOG.info("SQS message", id=msg_id, payload=payload)
+            put_metric("SQSMessageProcessed", 1)
+            # exemplo: reenfileirar em outra fila ou escrever no Dynamo
+            if ENV["SQS_QUEUE_URL"]:
+                sqs_send(ENV["SQS_QUEUE_URL"], {"echo": payload, "receivedAt": now_utc_iso()})
+        except Exception as e:
+            LOG.error("SQS record failed", id=msg_id, error=str(e))
+            failures.append({"itemIdentifier": rec.get("messageId")})
+    return {"batchItemFailures": failures}
+
+def handle_sns(event: dict, context) -> dict:
+    count = 0
+    for rec in event.get("Records", []):
+        msg = rec.get("Sns", {}).get("Message")
+        LOG.info("SNS message", message=msg)
+        count += 1
+    put_metric("SNSMessages", count)
+    return {"handled": count}
+
+def handle_eventbridge(event: dict, context) -> dict:
+    detail_type = event.get("detail-type")
+    source = event.get("source")
+    LOG.info("EventBridge event", detail_type=detail_type, source=source)
+    put_metric("EventBridgeInvocations", 1, dims={"DetailType": str(detail_type or "")})
+    # exemplo de tarefa agendada: publicar um heartbeat e salvar um item
+    if ENV["SNS_TOPIC_ARN"]:
+        sns_publish(ENV["SNS_TOPIC_ARN"], f"Heartbeat at {now_utc_iso()}", {"source": "automation"})
+    if ENV["TABLE_DATA"]:
+        ddb_put(ENV["TABLE_DATA"], {"pk": f"heartbeat#{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}", "ts": now_utc_iso()})
+    return {"ok": True}
+
+def handle_dynamodb_stream(event: dict, context) -> dict:
+    count = len(event.get("Records", []))
+    LOG.info("DynamoDB stream batch", count=count)
+    put_metric("DDBStreamRecords", count)
+    return {"count": count}
+
+def run_task(task: str, context_obj: Any) -> Any:
+    """Tarefas 'utilitárias' acionáveis via API /run?task=..."""
+    t = task.lower()
+    if t == "noop":
+        return {"ok": True, "ts": now_utc_iso()}
+    if t == "ping-sns" and ENV["SNS_TOPIC_ARN"]:
+        sns_publish(ENV["SNS_TOPIC_ARN"], f"Ping at {now_utc_iso()}")
+        return {"published": True}
+    if t == "put-item" and ENV["TABLE_DATA"]:
+        item = {"pk": f"item#{uuid.uuid4()}", "created_at": now_utc_iso()}
+        ddb_put(ENV["TABLE_DATA"], item)
+        return {"stored": item}
+    if t == "get-secret" and ENV["SECRET_NAME"]:
+        return {"secret": secret_get(ENV["SECRET_NAME"])[:8] + "..."}  # só um preview
+    if t == "get-param" and ENV["PARAM_NAME"]:
+        return {"param": param_get(ENV["PARAM_NAME"])}
+    return {"error": "task not available or not configured"}
+
+# ------------- Router principal -------------
+def lambda_handler(event, context):
+    cid = get_correlation_id(event, context)
+    LOG.info("Invocation started", correlation_id=cid, invoker="lambda", env=ENV["REGION"])
+    # API Gateway (v1/v2)
+    if isinstance(event, dict) and ("httpMethod" in event or "requestContext" in event and ("http" in event["requestContext"] or "stage" in event["requestContext"])):
+        return handle_api_gateway(event, context)
+
+    # Records-based
+    if isinstance(event, dict) and "Records" in event and event["Records"]:
+        src = event["Records"][0].get("eventSource") or event["Records"][0].get("EventSource")
+        if src == "aws:s3":
+            return handle_s3(event, context)
+        if src == "aws:sqs":
+            return handle_sqs(event, context)
+        if src == "aws:sns":
+            return handle_sns(event, context)
+        if src == "aws:dynamodb":
+            return handle_dynamodb_stream(event, context)
+
+    # EventBridge
+    if isinstance(event, dict) and ("detail-type" in event or event.get("source", "").startswith("aws.")):
+        return handle_eventbridge(event, context)
+
+    # Fallback
+    LOG.warn("Unknown event type, returning echo")
+    return resp_json(200, {"echo": event})
+
+# ------------- Resposta HTTP helper -------------
+def resp_json(code: int, body: Dict[str, Any]) -> dict:
+    return {
+        "statusCode": code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json_dumps(body),
+    }
+
+# ------------- Execução local opcional (para testes) -------------
+if __name__ == "__main__":
+    import argparse, sys
+    ap = argparse.ArgumentParser(description="Teste local de eventos")
+    ap.add_argument("--type", choices=["api", "s3", "sqs", "sns", "eventbridge"], default="api")
+    args = ap.parse_args()
+
+    class Ctx:
+        aws_request_id = str(uuid.uuid4())
+
+    if args.type == "api":
+        ev = {"rawPath": "/health", "requestContext": {"http": {"method": "GET"}}}
+    elif args.type == "s3":
+        ev = {"Records": [{"eventSource": "aws:s3", "s3": {"bucket": {"name": "my-bucket"}, "object": {"key": "path/file.txt"}}}]}
+    elif args.type == "sqs":
+        ev = {"Records": [{"eventSource": "aws:sqs", "messageId": str(uuid.uuid4()), "body": json_dumps({"hello": "world"})}]}
+    elif args.type == "sns":
+        ev = {"Records": [{"EventSource": "aws:sns", "Sns": {"Message": "hi there"}}]}
+    else:
+        ev = {"source": "aws.events", "detail-type": "Scheduled Event"}
+    out = lambda_handler(ev, Ctx())
+    print(json_dumps(out))
+
+# Exemplo de policies necessarias
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"},
+    {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":["arn:aws:s3:::SEU-BUCKET/*"]},
+    {"Effect":"Allow","Action":["dynamodb:PutItem","dynamodb:GetItem","dynamodb:UpdateItem"],"Resource":"arn:aws:dynamodb:REGION:ACCOUNT:table/SUA-TABELA*"},
+    {"Effect":"Allow","Action":["sqs:SendMessage"],"Resource":"arn:aws:sqs:REGION:ACCOUNT:SUA-FILA"},
+    {"Effect":"Allow","Action":["sns:Publish"],"Resource":"arn:aws:sns:REGION:ACCOUNT:SEU-TOPICO"},
+    {"Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:REGION:ACCOUNT:secret:SEU-SEGREDO*"},
+    {"Effect":"Allow","Action":["ssm:GetParameter"],"Resource":"arn:aws:ssm:REGION:ACCOUNT:parameter/SEU-PARAM"},
+    {"Effect":"Allow","Action":["kms:Encrypt","kms:Decrypt"],"Resource":"arn:aws:kms:REGION:ACCOUNT:key/SEU-KMS-ID"}
+  ]
+}
+
+# Criação de VPC
+objetivo: ter rede pronta para instâncias/ALB, com internet
+
+Abra VPC → Your VPCs → Create VPC
+Em Create VPC, escolha VPC and more (wizard) para facilitar.
+Preencha:
+Name tag: vpc-demo
+IPv4 CIDR: 10.0.0.0/16 (exemplo)
+Number of Availability Zones: 2
+Public subnets: 2
+NAT gateways: None (para algo bem simples)
+VPC endpoints: None (opcional)
+Marque Enable DNS hostnames (se aparecer)
+Clique Create VPC
+O assistente cria:
+VPC + Internet Gateway anexado
+2 subnets públicas em AZs diferentes
+Route table pública com rota 0.0.0.0/0 → igw-...
+Crie um Security Group (SG) para web:
+EC2 → Security Groups → Create
+Nome: sg-web | VPC: vpc-demo
+Inbound rules:
+HTTP TCP 80: 0.0.0.0/0
+(Opcional) HTTPS TCP 443: 0.0.0.0/0
+(Opcional) SSH TCP 22: se precisar, somente seu IP
+Outbound: deixe padrão (All traffic)
+Dica: se for usar EC2, lance as instâncias nas subnets públicas e anexe o sg-web
+
+# Criação de ALB
+Pré-requisitos: VPC pronta (acima), pelo menos 1 instância EC2 em execução com um servidor HTTP respondendo (ex.: curl localhost retorna algo) e usando o sg-web.
+
+Vá em EC2 → Load Balancers → Create load balancer
+Escolha Application Load Balancer → Create
+Configure:
+Name: alb-demo
+Scheme: Internet-facing
+IP address type: IPv4
+VPC: vpc-demo
+Mappings: selecione as 2 subnets públicas
+Security group: selecione sg-web
+Listeners:
+Adicione HTTP : 80 (padrão).
+(Se quiser HTTPS, crie também HTTPS : 443 com um ACM certificate)
+Target group:
+Clique Create target group (abrirá outra tela):
+Target type: Instance (simples)
+Name: tg-demo
+Protocol: HTTP : 80
+Health checks: Path / (ou /health se tiver)
+Next → Register targets: selecione suas instâncias EC2 → Include as pending → Create target group
+Volte ao formulário do ALB e no listener HTTP:80 selecione Forward to → tg-demo
+Create load balancer
+Testar: após “Active”, copie o DNS name do ALB (ex.: alb-demo-1234.region.elb.amazonaws.com) e acesse no navegador ou:
+curl http://alb-demo-1234.region.elb.amazonaws.com/
+
+# Criação api gateway rest http
+
+Acesse API Gateway → APIs → Build na seção HTTP API
+Create an API:
+API name: httpapi-demo
+Integrations: clique Add integration → Mock integration
+Routes:
+Add route
+Method: GET
+Resource path: /health
+Integration target: Mock integration
+Default stage: habilite Auto-deploy (ou crie o stage prod)
+Create.
+Em Routes → GET /health, clique Integration response e defina Status 200 e um body simples (ex.: {"ok":true}).
+Testar: pegue a Invoke URL do stage (ex.: https://abc123.execute-api.region.amazonaws.com) e:
+curl https://abc123.execute-api.region.amazonaws.com/health
+Integrar com ALB (opcional): em Integrations → Add integration → HTTP URL, informe http://<DNS-do-ALB> ou https://... se tiver TLS no ALB. Se seu ALB for privado, use VPC Link.
+
+
+
+
+
 ## 📝 Notas rápidas
 
 * **Porta 85**: sempre abra no **Security Group** se for acessar de fora. Em Ubuntu, o script `nginx_static_port85.sh` já troca o `listen` para 85.
